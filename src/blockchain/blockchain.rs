@@ -3,6 +3,13 @@ use super::transaction::Transaction;
 use crate::blockchain::merkle_tree::MerkleTree;
 use std::collections::HashMap;
 use crate::utils::Logger;
+use serde_json;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+const MIN_FEE_RATE: f64 = 0.00001; // Satoshis per byte
 
 pub struct Blockchain {
     pub chain: Vec<Block>,
@@ -15,6 +22,8 @@ pub struct Blockchain {
     pub block_time_window: Vec<chrono::Duration>,
     pub difficulty_adjustment_interval: u64,
     pub max_mempool_size: usize,
+    pub max_mempool_size_bytes: usize,
+    pub mempool_size_bytes: usize,
 }
 
 impl Blockchain {
@@ -31,6 +40,8 @@ impl Blockchain {
             block_time_window: Vec::new(),
             difficulty_adjustment_interval: 10, // Adjust this value as needed
             max_mempool_size: 1000, // Adjust this value as needed
+            max_mempool_size_bytes: 5_000_000, // 5 MB limit
+            mempool_size_bytes: 0,
         };
         blockchain.create_genesis_block();
         blockchain
@@ -66,35 +77,66 @@ impl Blockchain {
 
     pub fn mine_pending_transactions(&mut self, miner_address: &str) -> Result<(), String> {
         Logger::mining(&format!("Mining pending transactions for miner: {}", miner_address));
-    
-        // Get transactions from mempool
-        let mut transactions = self.get_transactions_from_mempool(1000);
-    
-        // If mempool is empty, use pending transactions
-        if transactions.is_empty() {
-            transactions = self.pending_transactions.drain(..).collect();
-        }
-    
+
+        let transactions = self.get_transactions_from_mempool(1000);
+        let transactions = if transactions.is_empty() {
+            self.pending_transactions.drain(..).collect()
+        } else {
+            transactions
+        };
+
         let reward_transaction = Transaction::new(
             String::from("Blockchain"),
             miner_address.to_string(),
             self.mining_reward,
-            0.0, // No fee for reward transactions
+            0.0,
         );
-        transactions.push(reward_transaction);
-    
+
+        let mut all_transactions = transactions;
+        all_transactions.push(reward_transaction);
+
         let new_block = Block::new(
             self.chain.len() as u64,
-            transactions,
+            all_transactions,
             self.get_latest_block().hash.clone(),
             self.difficulty,
         );
-    
-        let mut mineable_block = new_block;
-        mineable_block.mine_block(self.difficulty);
-    
-        if self.is_valid_new_block(&mineable_block, self.get_latest_block()) {
-            self.chain.push(mineable_block);
+
+        let mineable_block = Arc::new(Mutex::new(new_block));
+        let found = Arc::new(Mutex::new(false));
+        let num_threads = num_cpus::get();
+
+        let threads: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let block = Arc::clone(&mineable_block);
+                let found = Arc::clone(&found);
+                let difficulty = self.difficulty;
+
+                thread::spawn(move || {
+                    let mut local_block = block.lock().unwrap().clone();
+                    while !*found.lock().unwrap() {
+                        if local_block.mine_block(difficulty) {
+                            let mut found_lock = found.lock().unwrap();
+                            if !*found_lock {
+                                *found_lock = true;
+                                let mut block_lock = block.lock().unwrap();
+                                *block_lock = local_block;
+                            }
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let mined_block = mineable_block.lock().unwrap().clone();
+
+        if self.is_valid_new_block(&mined_block, self.get_latest_block()) {
+            self.chain.push(mined_block);
             self.update_balances();
             self.adjust_difficulty();
             Logger::mining("Successfully mined and added new block");
@@ -176,16 +218,26 @@ impl Blockchain {
         let expected_time = self.target_block_time * self.difficulty_adjustment_interval.try_into().unwrap();
         let actual_time = self.get_latest_block().timestamp - last_adjusted_block.timestamp;
 
-        if actual_time < expected_time / 2 {
-            self.difficulty += 1;
-        } else if actual_time > expected_time * 2 {
-            self.difficulty = self.difficulty.saturating_sub(1);
-        }
+        // Calculate the average block time for the last difficulty adjustment interval
+        let avg_block_time = actual_time / self.difficulty_adjustment_interval as i32;
 
-        self.block_time_window.push(actual_time);
+        // Calculate the ratio of actual time to expected time
+        let time_ratio = actual_time.num_seconds() as f64 / expected_time.num_seconds() as f64;
+
+        // Adjust difficulty based on the time ratio, but limit the change to 25% in either direction
+        let adjustment_factor = time_ratio.max(0.75).min(1.25);
+        let new_difficulty = (self.difficulty as f64 / adjustment_factor).max(1.0);
+
+        // Smooth out difficulty changes by averaging with the previous difficulty
+        self.difficulty = ((self.difficulty as f64 + new_difficulty) / 2.0).round() as u32;
+
+        // Update the block time window
+        self.block_time_window.push(avg_block_time);
         if self.block_time_window.len() > 10 {
             self.block_time_window.remove(0);
         }
+
+        Logger::info(&format!("Difficulty adjusted to: {}", self.difficulty));
     }
 
     pub fn validate_chain(&self) -> bool {
@@ -256,19 +308,39 @@ impl Blockchain {
             return Err("Transaction has expired".to_string());
         }
 
-        // Add transaction to mempool
-        self.mempool.push(transaction);
+        // Calculate transaction size (simplified, you may want to implement a more accurate size calculation)
+        let tx_size = self.calculate_transaction_size(&transaction);
+        let fee_rate = transaction.fee / tx_size as f64;
 
-        // Sort mempool by fee (highest fee first)
-        self.mempool.sort_by(|a, b| b.fee.partial_cmp(&a.fee).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Remove lowest fee transactions if mempool is too large
-        while self.mempool.len() > self.max_mempool_size {
-            self.mempool.pop();
+        if fee_rate < MIN_FEE_RATE {
+            return Err("Transaction fee rate is too low".to_string());
         }
 
-        Logger::info(&format!("Transaction added to mempool. Mempool size: {}", self.mempool.len()));
+        // Check if adding this transaction would exceed the mempool size limit
+        if self.mempool_size_bytes + tx_size > self.max_mempool_size_bytes {
+            self.evict_transactions(tx_size);
+        }
+
+        // Add transaction to mempool
+        self.mempool.push(transaction.clone());
+        self.mempool_size_bytes += tx_size;
+
+        // Sort mempool by fee rate (fee per byte)
+        self.sort_mempool();
+
+        Logger::info(&format!("Transaction added to mempool. Mempool size: {} bytes", self.mempool_size_bytes));
         Ok(())
+    }
+
+    fn evict_transactions(&mut self, required_space: usize) {
+        while self.mempool_size_bytes + required_space > self.max_mempool_size_bytes {
+            if let Some(tx) = self.mempool.pop() {
+                self.mempool_size_bytes -= self.calculate_transaction_size(&tx);
+                Logger::info(&format!("Evicted transaction {} from mempool", tx.id));
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn get_transactions_from_mempool(&mut self, max_transactions: usize) -> Vec<Transaction> {
@@ -278,5 +350,102 @@ impl Blockchain {
         let transactions: Vec<Transaction> = self.mempool.drain(..std::cmp::min(max_transactions, self.mempool.len())).collect();
         Logger::info(&format!("Retrieved {} transactions from mempool. Remaining mempool size: {}", transactions.len(), self.mempool.len()));
         transactions
+    }
+
+    pub fn replace_transaction(&mut self, new_transaction: Transaction) -> Result<(), String> {
+        if !new_transaction.is_valid() {
+            return Err("Invalid transaction".to_string());
+        }
+
+        let sender_balance = self.get_balance(&new_transaction.from);
+        if sender_balance < new_transaction.amount + new_transaction.fee {
+            return Err("Insufficient balance".to_string());
+        }
+
+        let old_tx_index = self.mempool.iter().position(|tx| tx.id == new_transaction.id);
+
+        if let Some(index) = old_tx_index {
+            let old_tx = &self.mempool[index];
+            if new_transaction.fee <= old_tx.fee {
+                return Err("New transaction must have a higher fee for RBF".to_string());
+            }
+
+            // Remove old transaction and update mempool size
+            let old_tx_size = self.calculate_transaction_size(old_tx);
+            self.mempool.remove(index);
+            self.mempool_size_bytes -= old_tx_size;
+
+            // Add new transaction
+            let new_tx_size = self.calculate_transaction_size(&new_transaction);
+            self.mempool.push(new_transaction);
+            self.mempool_size_bytes += new_tx_size;
+
+            // Re-sort mempool
+            self.sort_mempool();
+
+            Logger::info(&format!("Transaction replaced in mempool. New mempool size: {} bytes", self.mempool_size_bytes));
+            Ok(())
+        } else {
+            Err("Original transaction not found in mempool".to_string())
+        }
+    }
+
+    pub fn save_mempool(&self, file_path: &str) -> std::io::Result<()> {
+        let serialized = serde_json::to_string(&self.mempool)?;
+        let mut file = File::create(file_path)?;
+        file.write_all(serialized.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn load_mempool(&mut self, file_path: &str) -> std::io::Result<()> {
+        let mut file = File::open(file_path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        self.mempool = serde_json::from_str(&contents)?;
+        self.mempool_size_bytes = self.mempool.iter().map(|tx| self.calculate_transaction_size(tx)).sum();
+        Ok(())
+    }
+
+    fn calculate_transaction_size(&self, transaction: &Transaction) -> usize {
+        // This is a simplified calculation and should be adjusted based on your actual transaction structure
+        let base_size = std::mem::size_of::<Transaction>();
+        let variable_size = transaction.from.len() + transaction.to.len() + transaction.signature.as_ref().map_or(0, |s| s.len());
+        base_size + variable_size
+    }
+
+    pub fn clean_expired_transactions(&mut self) {
+        let current_time = chrono::Utc::now().timestamp();
+        let expired_transactions: Vec<_> = self.mempool
+            .iter()
+            .filter(|tx| tx.expiration < current_time)
+            .cloned()
+            .collect();
+
+        for tx in expired_transactions {
+            let tx_size = self.calculate_transaction_size(&tx);
+            self.mempool.retain(|t| t.id != tx.id);
+            self.mempool_size_bytes -= tx_size;
+            Logger::info(&format!("Removed expired transaction {} from mempool", tx.id));
+        }
+
+        self.sort_mempool();
+    }
+
+    fn sort_mempool(&mut self) {
+        let tx_sizes: Vec<_> = self.mempool.iter()
+            .map(|tx| self.calculate_transaction_size(tx))
+            .collect();
+        
+        let mut indices: Vec<usize> = (0..self.mempool.len()).collect();
+        
+        indices.sort_by(|&a, &b| {
+            let a_fee_rate = self.mempool[a].fee / tx_sizes[a] as f64;
+            let b_fee_rate = self.mempool[b].fee / tx_sizes[b] as f64;
+            b_fee_rate.partial_cmp(&a_fee_rate).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        // Reorder the mempool based on the sorted indices
+        let sorted_mempool: Vec<_> = indices.into_iter().map(|i| self.mempool[i].clone()).collect();
+        self.mempool = sorted_mempool;
     }
 }

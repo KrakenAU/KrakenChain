@@ -56,7 +56,7 @@ impl Block {
         hash
     }
 
-    pub fn mine_block(&mut self, difficulty: u32) {
+    pub fn mine_block(&mut self, difficulty: u32) -> bool {
         Logger::mining(&format!("Mining block: {} with difficulty: {}", self.index, difficulty));
         let target = (1u128 << (128 - difficulty)) - 1;
         let mut attempts = 0;
@@ -69,6 +69,7 @@ impl Block {
             }
         }
         Logger::mining(&format!("Block {} mined successfully after {} attempts. Final hash: {}", self.index, attempts, self.hash));
+        true
     }
 
     pub fn has_valid_transactions(&self) -> bool {

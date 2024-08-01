@@ -9,9 +9,16 @@ pub struct MerkleTree {
 impl MerkleTree {
     pub fn new(transactions: &[Transaction]) -> Self {
         let mut nodes: Vec<Vec<u8>> = transactions.iter().map(|tx| tx.calculate_hash()).collect();
+        
+        // If there's an odd number of transactions, duplicate the last one
+        if nodes.len() % 2 != 0 {
+            nodes.push(nodes.last().unwrap().clone());
+        }
+
         while nodes.len() > 1 {
             nodes = MerkleTree::pair_and_hash(nodes);
         }
+
         MerkleTree {
             root: nodes.first().cloned().unwrap_or_default(),
             nodes,
@@ -22,16 +29,21 @@ impl MerkleTree {
         nodes.chunks(2).map(|chunk| {
             let left = &chunk[0];
             let right = chunk.get(1).unwrap_or(left);
-            let mut hasher = Sha256::new();
-            hasher.update(left);
-            hasher.update(right);
-            hasher.finalize().to_vec()
+            MerkleTree::hash_pair(left, right)
         }).collect()
     }
 
-    pub fn get_proof(&self, transaction: &Transaction) -> Vec<Vec<u8>> {
+    fn hash_pair(left: &[u8], right: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(left);
+        hasher.update(right);
+        hasher.finalize().to_vec()
+    }
+
+    pub fn get_proof(&self, transaction: &Transaction) -> Option<Vec<Vec<u8>>> {
+        let tx_hash = transaction.calculate_hash();
+        let mut index = self.nodes.iter().position(|hash| hash == &tx_hash)?;
         let mut proof = Vec::new();
-        let mut index = self.nodes.iter().position(|hash| hash == &transaction.calculate_hash()).unwrap_or(0);
         let mut level_size = self.nodes.len() / 2;
 
         while level_size > 0 {
@@ -43,21 +55,17 @@ impl MerkleTree {
             level_size /= 2;
         }
 
-        proof
+        Some(proof)
     }
 
     pub fn verify_proof(root: &[u8], transaction: &Transaction, proof: &[Vec<u8>]) -> bool {
         let mut hash = transaction.calculate_hash();
         for sibling in proof {
-            let mut hasher = Sha256::new();
-            if hash < *sibling {
-                hasher.update(&hash);
-                hasher.update(sibling);
+            hash = if hash < *sibling {
+                MerkleTree::hash_pair(&hash, sibling)
             } else {
-                hasher.update(sibling);
-                hasher.update(&hash);
-            }
-            hash = hasher.finalize().to_vec();
+                MerkleTree::hash_pair(sibling, &hash)
+            };
         }
         hash == root
     }
